@@ -38,6 +38,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+import networkx as nx
+from urllib.parse import urlparse
 
 DB_PATH = Path(__file__).resolve().parent / "crawl_store.db"
 SAMPLE_DATASET_PATH = Path(__file__).resolve().parent / "sample_dataset.csv"
@@ -249,7 +251,9 @@ def crawl(seeds: list[str], max_depth: int, max_pages: int, same_domain_only: bo
             "domain": registered_domain(url), "crawl_depth": depth, "seed_url": seed,
             "http_status": resp.status_code,
             "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "source_type": "web", "source_detail": "",
+            "source_type": "web", 
+            "source_detail": "",
+            "outgoing_links": page["links"],
         })
 
     return documents, stats, seen_urls, log_rows
@@ -396,6 +400,11 @@ CREATE TABLE IF NOT EXISTS metadata (
 CREATE TABLE IF NOT EXISTS urls (
     url_canonical TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS document_links (
+    source_doc_id TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    PRIMARY KEY (source_doc_id, target_url)
+);
 """
 
 
@@ -438,6 +447,30 @@ def store_documents(docs: list[dict]) -> None:
                  d["seed_url"], d["http_status"], d["fetched_at"],
                  d.get("source_type", "web"), d.get("source_detail", "")))
 
+def store_document_links(docs):
+    """
+    Store outgoing hyperlinks extracted from crawled documents.
+    """
+
+    with db() as con:
+
+        for doc in docs:
+
+            source_doc_id = doc["doc_id"]
+
+            for target_url in doc.get("outgoing_links", []):
+
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO document_links
+                    (source_doc_id, target_url)
+                    VALUES (?, ?)
+                    """,
+                    (
+                        source_doc_id,
+                        target_url
+                    )
+                )
 
 def store_urls(urls: set[str]) -> None:
     with db() as con:
@@ -480,9 +513,8 @@ def source_breakdown() -> pd.DataFrame:
 
 def reset_store() -> None:
     with db() as con:
-        for t in ("documents", "metadata", "urls"):
+        for t in ("documents", "metadata", "urls", "document_links"):
             con.execute(f"DELETE FROM {t}")
-
 
 # =============================================================================
 # 3. PREPROCESSING
@@ -676,6 +708,535 @@ def bar_chart(labels, values, title, xlabel="", ylabel="", horizontal=False):
     fig.tight_layout()
     return fig
 
+# =============================================================================
+# 5. WEB SEARCHING, RANKING & PAGERANK
+# =============================================================================
+
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+@st.cache_data(show_spinner=False)
+def build_search_index(token_lists):
+    """
+    Build a TF-IDF index over the preprocessed corpus.
+
+    Returns:
+        matrix       : document-term TF-IDF matrix
+        vocabulary   : vocabulary terms
+        vectorizer   : fitted TF-IDF vectorizer
+    """
+    joined = [" ".join(tokens) for tokens in token_lists]
+
+    vectorizer = TfidfVectorizer(
+        analyzer="word",
+        token_pattern=r"\S+",
+        ngram_range=(1, 2),
+        min_df=1,
+        sublinear_tf=True
+    )
+
+    matrix = vectorizer.fit_transform(joined)
+    vocabulary = vectorizer.get_feature_names_out().tolist()
+
+    return matrix, vocabulary, vectorizer
+
+
+@st.cache_data(show_spinner=False)
+def search_documents(
+    query,
+    corpus_records,
+    token_lists,
+    top_k=10,
+    use_query_expansion=True
+):
+    """
+    Search the indexed corpus using TF-IDF cosine similarity.
+
+    Query processing:
+        raw query
+            ↓
+        existing preprocessing pipeline
+            ↓
+        optional simple query expansion
+            ↓
+        TF-IDF query vector
+            ↓
+        cosine similarity
+            ↓
+        ranked documents
+    """
+
+    if not query or not query.strip():
+        return pd.DataFrame()
+
+    query_tokens = preprocess(
+        query,
+        remove_stopwords=True,
+        use_stemming=True
+    )
+
+    if not query_tokens:
+        return pd.DataFrame()
+
+    # ---------------------------------------------------------
+    # Simple query expansion
+    # ---------------------------------------------------------
+    expanded_tokens = list(query_tokens)
+
+    if use_query_expansion:
+        # Add frequently occurring terms from documents
+        # that share tokens with the query.
+        corpus_counter = Counter(
+            token
+            for tokens in token_lists
+            for token in tokens
+        )
+
+        for token in query_tokens:
+            related = [
+                t for t, freq in corpus_counter.most_common(100)
+                if (
+                    len(t) >= 4
+                    and t != token
+                    and t[:4] == token[:4]
+                )
+            ]
+
+            expanded_tokens.extend(related[:2])
+
+    query_text = " ".join(expanded_tokens)
+
+    # ---------------------------------------------------------
+    # Build document index
+    # ---------------------------------------------------------
+    matrix, vocabulary, vectorizer = build_search_index(token_lists)
+
+    # ---------------------------------------------------------
+    # Transform query using same fitted vectorizer
+    # ---------------------------------------------------------
+    query_vector = vectorizer.transform([query_text])
+
+    # ---------------------------------------------------------
+    # Cosine similarity
+    # ---------------------------------------------------------
+    scores = cosine_similarity(
+        query_vector,
+        matrix
+    ).ravel()
+
+    rows = []
+
+    for i, score in enumerate(scores):
+        if score <= 0:
+            continue
+
+        doc = corpus_records.iloc[i]
+
+        rows.append({
+            "doc_index": i,
+            "score": float(score),
+            "title": doc["title"],
+            "domain": doc["domain"],
+            "source_type": doc["source_type"],
+            "url": doc["url"],
+            "doc_id": doc["doc_id"],
+            "preview": str(doc["raw_text"])[:350].replace("\n", " ")
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    results = pd.DataFrame(rows)
+
+    results = (
+        results
+        .sort_values(
+            "score",
+            ascending=False
+        )
+        .head(top_k)
+        .reset_index(drop=True)
+    )
+
+    results.insert(
+        0,
+        "rank",
+        range(1, len(results) + 1)
+    )
+
+    results["score"] = results["score"].round(4)
+
+    return results
+
+
+# def build_document_graph(corpus):
+#     """
+#     Build a directed document graph.
+
+#     Nodes:
+#         acquired documents
+
+#     Edges:
+#         document A -> document B when A's URL links to B's URL.
+
+#     Since the current crawler stores metadata but not the complete
+#     outgoing-link list, this function reconstructs a lightweight
+#     graph from URL/domain relationships and acquired pages.
+
+#     The graph also includes domain-level relationships so that
+#     PageRank remains useful when the corpus contains heterogeneous
+#     sources.
+#     """
+
+#     graph = nx.DiGraph()
+
+#     if corpus is None or corpus.empty:
+#         return graph
+
+#     # Add every document as a node.
+#     for _, row in corpus.iterrows():
+#         graph.add_node(
+#             row["doc_id"],
+#             title=row["title"],
+#             url=row["url"],
+#             domain=row["domain"]
+#         )
+
+#     # ---------------------------------------------------------
+#     # Create links using URL/domain relationships.
+#     #
+#     # For crawled web documents, documents from the same
+#     # domain are connected. This gives PageRank a graph even
+#     # when only document metadata is available.
+#     # ---------------------------------------------------------
+#     web_docs = corpus[
+#         corpus["source_type"].astype(str).str.lower() == "web"
+#     ]
+
+#     if len(web_docs) > 1:
+#         for _, source in web_docs.iterrows():
+
+#             source_id = source["doc_id"]
+#             source_domain = source["domain"]
+
+#             candidates = web_docs[
+#                 web_docs["doc_id"] != source_id
+#             ]
+
+#             # Link to a limited number of documents from the
+#             # same domain to prevent a dense O(N^2) graph.
+#             same_domain = candidates[
+#                 candidates["domain"] == source_domain
+#             ].head(10)
+
+#             for _, target in same_domain.iterrows():
+#                 graph.add_edge(
+#                     source_id,
+#                     target["doc_id"]
+#                 )
+
+#     # ---------------------------------------------------------
+#     # Connect documents from different acquisition sources
+#     # through domain/source relationships.
+#     # ---------------------------------------------------------
+#     for source_type in corpus["source_type"].dropna().unique():
+
+#         group = corpus[
+#             corpus["source_type"] == source_type
+#         ]
+
+#         ids = group["doc_id"].tolist()
+
+#         for i in range(len(ids) - 1):
+#             graph.add_edge(
+#                 ids[i],
+#                 ids[i + 1]
+#             )
+
+#     return graph
+
+def build_document_graph(corpus):
+    """
+    Build a directed document graph from actual crawled hyperlinks.
+
+    Nodes:
+        All documents currently present in the corpus.
+
+    Edges:
+        source_doc_id -> target_doc_id when the source document's
+        actual outgoing hyperlink points to another document in
+        the current corpus.
+    """
+    graph = nx.DiGraph()
+
+    if corpus is None or corpus.empty:
+        return graph
+
+    # ---------------------------------------------------------
+    # Add every document as a node
+    # ---------------------------------------------------------
+    for _, row in corpus.iterrows():
+        graph.add_node(
+            row["doc_id"],
+            title=row["title"],
+            url=row["url"],
+            domain=row["domain"]
+        )
+
+    # ---------------------------------------------------------
+    # Map canonical URL -> document ID
+    # ---------------------------------------------------------
+    url_to_doc_id = {}
+
+    for _, row in corpus.iterrows():
+        url = canonicalize_url(row["url"])
+
+        if url:
+            url_to_doc_id[url] = row["doc_id"]
+
+    # ---------------------------------------------------------
+    # Read actual hyperlinks collected by the crawler
+    # ---------------------------------------------------------
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT source_doc_id, target_url
+            FROM document_links
+            """
+        ).fetchall()
+
+    # ---------------------------------------------------------
+    # Convert URL links into document-to-document edges
+    # ---------------------------------------------------------
+    for source_doc_id, target_url in rows:
+
+        if source_doc_id not in graph:
+            continue
+
+        target_url = canonicalize_url(target_url)
+
+        target_doc_id = url_to_doc_id.get(target_url)
+
+        if target_doc_id is not None:
+            graph.add_edge(
+                source_doc_id,
+                target_doc_id
+            )
+
+    return graph
+
+@st.cache_data(show_spinner=False)
+def calculate_pagerank(corpus_records):
+    """
+    Calculate PageRank over the document graph.
+    """
+
+    graph = build_document_graph(corpus_records)
+
+    if graph.number_of_nodes() == 0:
+        return pd.DataFrame()
+
+    pagerank_scores = nx.pagerank(
+        graph,
+        alpha=0.85,
+        max_iter=100,
+        tol=1e-6
+    )
+
+    rows = []
+
+    for _, row in corpus_records.iterrows():
+
+        rows.append({
+            "doc_id": row["doc_id"],
+            "title": row["title"],
+            "domain": row["domain"],
+            "pagerank": pagerank_scores.get(
+                row["doc_id"],
+                0.0
+            )
+        })
+
+    result = pd.DataFrame(rows)
+
+    result = result.sort_values(
+        "pagerank",
+        ascending=False
+    ).reset_index(drop=True)
+
+    result.insert(
+        0,
+        "rank",
+        range(1, len(result) + 1)
+    )
+
+    result["pagerank"] = result["pagerank"].round(6)
+
+    return result
+
+
+def combine_relevance_and_pagerank(
+    search_results,
+    pagerank_df,
+    relevance_weight=0.75
+):
+    """
+    Combine query relevance with PageRank.
+
+    Combined score:
+
+        alpha * normalized_TFIDF
+        +
+        (1-alpha) * normalized_PageRank
+    """
+
+    if search_results.empty:
+        return search_results
+
+    if pagerank_df.empty:
+        return search_results
+
+    results = search_results.copy()
+
+    results = results.merge(
+        pagerank_df[
+            ["doc_id", "pagerank"]
+        ],
+        on="doc_id",
+        how="left"
+    )
+
+    results["pagerank"] = (
+        results["pagerank"]
+        .fillna(0.0)
+    )
+
+    # ---------------------------------------------------------
+    # Normalize relevance scores
+    # ---------------------------------------------------------
+    max_score = results["score"].max()
+
+    if max_score > 0:
+        results["norm_relevance"] = (
+            results["score"] / max_score
+        )
+    else:
+        results["norm_relevance"] = 0.0
+
+    # ---------------------------------------------------------
+    # Normalize PageRank
+    # ---------------------------------------------------------
+    max_pr = results["pagerank"].max()
+
+    if max_pr > 0:
+        results["norm_pagerank"] = (
+            results["pagerank"] / max_pr
+        )
+    else:
+        results["norm_pagerank"] = 0.0
+
+    # ---------------------------------------------------------
+    # Combined ranking
+    # ---------------------------------------------------------
+    results["combined_score"] = (
+        relevance_weight * results["norm_relevance"]
+        +
+        (1 - relevance_weight) * results["norm_pagerank"]
+    )
+
+    results = results.sort_values(
+        "combined_score",
+        ascending=False
+    ).reset_index(drop=True)
+
+    results.insert(
+        0,
+        "combined_rank",
+        range(1, len(results) + 1)
+    )
+
+    results["combined_score"] = (
+        results["combined_score"].round(4)
+    )
+
+    results["pagerank"] = (
+        results["pagerank"].round(6)
+    )
+
+    return results
+
+
+def ranking_comparison_table(
+    search_results,
+    pagerank_df
+):
+    """
+    Show how relevance ranking and PageRank ranking differ.
+    """
+
+    if search_results.empty or pagerank_df.empty:
+        return pd.DataFrame()
+
+    relevance = search_results[
+        [
+            "doc_id",
+            "title",
+            "score"
+        ]
+    ].copy()
+
+    relevance["tfidf_rank"] = (
+        relevance["score"]
+        .rank(
+            method="min",
+            ascending=False
+        )
+        .astype(int)
+    )
+
+    pr = pagerank_df[
+        [
+            "doc_id",
+            "pagerank"
+        ]
+    ].copy()
+
+    pr["pagerank_rank"] = (
+        pr["pagerank"]
+        .rank(
+            method="min",
+            ascending=False
+        )
+        .astype(int)
+    )
+
+    result = relevance.merge(
+        pr,
+        on="doc_id",
+        how="left"
+    )
+
+    result["rank_change"] = (
+        result["tfidf_rank"]
+        -
+        result["pagerank_rank"]
+    )
+
+    result = result.sort_values(
+        "tfidf_rank"
+    )
+
+    return result[
+        [
+            "tfidf_rank",
+            "pagerank_rank",
+            "rank_change",
+            "title",
+            "score",
+            "pagerank"
+        ]
+    ].reset_index(drop=True)
+
 
 # =============================================================================
 # STREAMLIT UI
@@ -692,8 +1253,8 @@ st.session_state.setdefault("tokens", None)
 if st.session_state.corpus is None and store_counts()[0] > 0:
     st.session_state.corpus = load_corpus()
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["1 · Acquire & store", "2 · Preprocess", "3 · Features & keywords", "4 · Analytics & classification"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["1 · Acquire & store", "2 · Preprocess", "3 · Features & keywords", "4 · Analytics & classification", "5 · Web Search & Ranking"])
 
 # --------------------------------------------------------------------------- #
 # Tab 1 — acquisition: web crawl, public dataset, public API
@@ -755,6 +1316,7 @@ with tab1:
                         seeds, max_depth, int(max_pages), same_domain, delay,
                         known_urls(), known_hashes(), log_fn)
                     store_documents(docs)
+                    store_document_links(docs)
                     store_urls(seen)
                     st.session_state.corpus = load_corpus()
                 progress.empty()
@@ -1067,3 +1629,466 @@ with tab4:
             fig.colorbar(im)
             fig.tight_layout()
             st.pyplot(fig)
+
+# --------------------------------------------------------------------------- #
+# Tab 5 — Section D: Web Search & Ranking
+# --------------------------------------------------------------------------- #
+
+with tab5:
+
+    st.header("Web Searching & Ranking")
+
+    st.caption(
+        "Search the indexed document collection using TF-IDF relevance, "
+        "query expansion and PageRank-based ranking."
+    )
+
+    # -----------------------------------------------------------------------
+    # Corpus requirement
+    # -----------------------------------------------------------------------
+
+    if st.session_state.corpus is None:
+
+        st.warning(
+            "No corpus is currently loaded. "
+            "Go to **Acquire & store** and acquire documents first."
+        )
+
+    elif st.session_state.tokens is None:
+
+        st.warning(
+            "The corpus exists, but it has not been preprocessed yet."
+        )
+
+        st.info(
+            "Go to **Preprocess**, enable your preprocessing options, "
+            "and then return here."
+        )
+
+    else:
+
+        corpus = st.session_state.corpus
+        tokens = st.session_state.tokens
+
+        # ================================================================
+        # SEARCH INTERFACE
+        # ================================================================
+
+        st.subheader("1. Search indexed collection")
+
+        c1, c2, c3 = st.columns([5, 1, 2])
+
+        with c1:
+
+            query = st.text_input(
+                "Search query",
+                value="information retrieval",
+                placeholder="Enter your search query..."
+            )
+
+        with c2:
+
+            top_k = st.number_input(
+                "Top-K",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1
+            )
+
+        with c3:
+
+            query_expansion = st.checkbox(
+                "Query expansion",
+                value=True
+            )
+
+        search_button = st.button(
+            "Search",
+            type="primary",
+            use_container_width=True
+        )
+
+        # ================================================================
+        # SEARCH EXECUTION
+        # ================================================================
+
+        if search_button:
+
+            if not query.strip():
+
+                st.warning(
+                    "Please enter a search query."
+                )
+
+            else:
+
+                with st.spinner(
+                    "Searching indexed collection..."
+                ):
+
+                    results = search_documents(
+                        query=query,
+                        corpus_records=corpus,
+                        token_lists=tokens,
+                        top_k=int(top_k),
+                        use_query_expansion=query_expansion
+                    )
+
+                st.session_state["search_results"] = results
+                st.session_state["search_query"] = query
+
+        # ================================================================
+        # DISPLAY SEARCH RESULTS
+        # ================================================================
+
+        if "search_results" in st.session_state:
+
+            results = st.session_state["search_results"]
+
+            if results.empty:
+
+                st.info(
+                    "No relevant documents were found for this query."
+                )
+
+            else:
+
+                st.success(
+                    f"Found {len(results)} relevant documents."
+                )
+
+                st.subheader(
+                    "Ranked retrieval results"
+                )
+
+                display_results = results[
+                    [
+                        "rank",
+                        "title",
+                        "score",
+                        "domain",
+                        "source_type",
+                        "url"
+                    ]
+                ].copy()
+
+                display_results["score"] = (
+                    display_results["score"]
+                    .map(lambda x: f"{x:.4f}")
+                )
+
+                st.dataframe(
+                    display_results,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                # --------------------------------------------------------
+                # Detailed result view
+                # --------------------------------------------------------
+
+                st.subheader(
+                    "Result details"
+                )
+
+                selected_rank = st.selectbox(
+                    "Select a result",
+                    options=results["rank"].tolist(),
+                    format_func=lambda x:
+                        f"Rank {x} — "
+                        f"{results.loc[results['rank'] == x, 'title'].iloc[0][:90]}"
+                )
+
+                selected = results[
+                    results["rank"] == selected_rank
+                ].iloc[0]
+
+                d1, d2 = st.columns([2, 1])
+
+                with d1:
+
+                    st.markdown(
+                        f"### {selected['title']}"
+                    )
+
+                    st.write(
+                        selected["preview"]
+                    )
+
+                with d2:
+
+                    st.metric(
+                        "TF-IDF relevance",
+                        f"{selected['score']:.4f}"
+                    )
+
+                    st.write(
+                        f"**Domain:** {selected['domain']}"
+                    )
+
+                    st.write(
+                        f"**Source:** {selected['source_type']}"
+                    )
+
+                    st.write(
+                        f"**Document ID:** {selected['doc_id']}"
+                    )
+
+                    st.write(
+                        f"**URL:** {selected['url']}"
+                    )
+
+                # --------------------------------------------------------
+                # Relevance ranking visualization
+                # --------------------------------------------------------
+
+                st.subheader(
+                    "Relevance ranking visualization"
+                )
+
+                fig, ax = plt.subplots(
+                    figsize=(9, 5)
+                )
+
+                plot_results = results.head(
+                    min(10, len(results))
+                ).iloc[::-1]
+
+                ax.barh(
+                    plot_results["title"].str.slice(0, 45),
+                    plot_results["score"]
+                )
+
+                ax.set_xlabel(
+                    "TF-IDF cosine similarity"
+                )
+
+                ax.set_ylabel(
+                    "Document"
+                )
+
+                ax.set_title(
+                    "Top documents ranked by query relevance"
+                )
+
+                fig.tight_layout()
+
+                st.pyplot(fig)
+
+        # ================================================================
+        # PAGE RANK
+        # ================================================================
+
+        st.divider()
+
+        st.subheader(
+            "2. PageRank analysis"
+        )
+
+        st.write(
+            "PageRank measures the importance of documents in the "
+            "document-link graph. It is independent of the current "
+            "search query."
+        )
+
+        calculate_pr = st.button(
+            "Calculate PageRank",
+            type="secondary"
+        )
+
+        if calculate_pr:
+
+            with st.spinner(
+                "Building document graph and calculating PageRank..."
+            ):
+
+                pr_df = calculate_pagerank(
+                    corpus
+                )
+
+            st.session_state["pagerank"] = pr_df
+
+        if "pagerank" in st.session_state:
+
+            pr_df = st.session_state["pagerank"]
+
+            if pr_df.empty:
+
+                st.info(
+                    "PageRank could not be calculated because "
+                    "the corpus is empty."
+                )
+
+            else:
+
+                st.metric(
+                    "Documents in PageRank graph",
+                    len(pr_df)
+                )
+
+                st.dataframe(
+                    pr_df.head(20),
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                # --------------------------------------------------------
+                # PageRank visualization
+                # --------------------------------------------------------
+
+                plot_pr = pr_df.head(
+                    min(15, len(pr_df))
+                ).iloc[::-1]
+
+                fig, ax = plt.subplots(
+                    figsize=(9, 5)
+                )
+
+                ax.barh(
+                    plot_pr["title"].str.slice(0, 45),
+                    plot_pr["pagerank"]
+                )
+
+                ax.set_xlabel(
+                    "PageRank score"
+                )
+
+                ax.set_ylabel(
+                    "Document"
+                )
+
+                ax.set_title(
+                    "Top documents by PageRank"
+                )
+
+                fig.tight_layout()
+
+                st.pyplot(fig)
+
+        # ================================================================
+        # COMBINED RANKING
+        # ================================================================
+
+        if (
+            "search_results" in st.session_state
+            and not st.session_state["search_results"].empty
+            and "pagerank" in st.session_state
+        ):
+
+            st.divider()
+
+            st.subheader(
+                "3. Combined relevance + PageRank ranking"
+            )
+
+            st.write(
+                "The final ranking combines query relevance with "
+                "document importance."
+            )
+
+            weight = st.slider(
+                "Weight given to query relevance",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.75,
+                step=0.05
+            )
+
+            combined = combine_relevance_and_pagerank(
+                st.session_state["search_results"],
+                st.session_state["pagerank"],
+                relevance_weight=weight
+            )
+
+            st.dataframe(
+                combined[
+                    [
+                        "combined_rank",
+                        "title",
+                        "score",
+                        "pagerank",
+                        "combined_score",
+                        "domain"
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True
+            )
+
+            # ------------------------------------------------------------
+            # Compare rankings
+            # ------------------------------------------------------------
+
+            st.subheader(
+                "Ranking comparison"
+            )
+
+            comparison = ranking_comparison_table(
+                st.session_state["search_results"],
+                st.session_state["pagerank"]
+            )
+
+            if not comparison.empty:
+
+                st.dataframe(
+                    comparison,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+            # ------------------------------------------------------------
+            # Combined ranking visualization
+            # ------------------------------------------------------------
+
+            plot_combined = combined.head(
+                min(10, len(combined))
+            ).iloc[::-1]
+
+            fig, ax = plt.subplots(
+                figsize=(9, 5)
+            )
+
+            ax.barh(
+                plot_combined["title"].str.slice(0, 45),
+                plot_combined["combined_score"]
+            )
+
+            ax.set_xlabel(
+                "Combined ranking score"
+            )
+
+            ax.set_ylabel(
+                "Document"
+            )
+
+            ax.set_title(
+                "Final ranking: TF-IDF relevance + PageRank"
+            )
+
+            fig.tight_layout()
+
+            st.pyplot(fig)
+
+            # ------------------------------------------------------------
+            # Explanation
+            # ------------------------------------------------------------
+
+            st.info(
+                f"""
+                **Ranking interpretation**
+
+                Query relevance weight: **{weight:.2f}**
+
+                PageRank weight: **{1 - weight:.2f}**
+
+                A high TF-IDF score means the document is highly relevant
+                to the user's query.
+
+                A high PageRank score means the document is considered
+                important within the document graph.
+
+                The combined ranking demonstrates why relevance and
+                authority can produce different rankings.
+                """
+            )
