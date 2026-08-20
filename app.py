@@ -1239,6 +1239,128 @@ def ranking_comparison_table(
 
 
 # =============================================================================
+# 6. SECTION E — CONTENT-BASED RECOMMENDER SYSTEM
+# =============================================================================
+
+@st.cache_data(show_spinner=False)
+def build_recommendation_index(token_lists):
+    """
+    Build a TF-IDF representation of all documents for content-based
+    recommendation.
+
+    Returns:
+        matrix      : document-term TF-IDF matrix
+        vectorizer  : fitted TF-IDF vectorizer
+    """
+
+    joined = [" ".join(tokens) for tokens in token_lists]
+
+    if not joined or not any(joined):
+        return None, None
+
+    vectorizer = TfidfVectorizer(
+        analyzer="word",
+        token_pattern=r"\S+",
+        ngram_range=(1, 2),
+        min_df=1,
+        sublinear_tf=True
+    )
+
+    matrix = vectorizer.fit_transform(joined)
+
+    return matrix, vectorizer
+
+
+@st.cache_data(show_spinner=False)
+def recommend_similar_documents(
+    selected_index,
+    corpus_records,
+    token_lists,
+    top_k=5
+):
+    """
+    Content-based recommendation.
+
+    The selected document is represented using TF-IDF.
+    Cosine similarity is calculated against every other document.
+    The selected document itself is excluded.
+
+    Returns:
+        DataFrame containing recommended documents and similarity scores.
+    """
+
+    if (
+        corpus_records is None
+        or len(corpus_records) == 0
+        or token_lists is None
+        or len(token_lists) == 0
+    ):
+        return pd.DataFrame()
+
+    if selected_index < 0 or selected_index >= len(corpus_records):
+        return pd.DataFrame()
+
+    matrix, vectorizer = build_recommendation_index(token_lists)
+
+    if matrix is None:
+        return pd.DataFrame()
+
+    # Selected document vector
+    selected_vector = matrix[selected_index]
+
+    # Similarity against every document
+    similarities = cosine_similarity(
+        selected_vector,
+        matrix
+    ).ravel()
+
+    # Do not recommend the document itself
+    similarities[selected_index] = -1.0
+
+    # Number of recommendations
+    k = min(int(top_k), len(corpus_records) - 1)
+
+    if k <= 0:
+        return pd.DataFrame()
+
+    # Highest similarity first
+    recommended_indices = np.argsort(
+        similarities
+    )[::-1][:k]
+
+    rows = []
+
+    for rank, idx in enumerate(recommended_indices, start=1):
+
+        score = float(similarities[idx])
+
+        # Ignore zero-similarity documents
+        if score <= 0:
+            continue
+
+        doc = corpus_records.iloc[idx]
+
+        rows.append({
+            "rank": rank,
+            "doc_index": int(idx),
+            "similarity": round(score, 4),
+            "title": doc["title"],
+            "domain": doc["domain"],
+            "source_type": doc["source_type"],
+            "url": doc["url"],
+            "doc_id": doc["doc_id"],
+            "preview": str(
+                doc["raw_text"]
+            )[:350].replace("\n", " ")
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
 # STREAMLIT UI
 # =============================================================================
 
@@ -1253,8 +1375,16 @@ st.session_state.setdefault("tokens", None)
 if st.session_state.corpus is None and store_counts()[0] > 0:
     st.session_state.corpus = load_corpus()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["1 · Acquire & store", "2 · Preprocess", "3 · Features & keywords", "4 · Analytics & classification", "5 · Web Search & Ranking"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    [
+        "1 · Acquire & store",
+        "2 · Preprocess",
+        "3 · Features & keywords",
+        "4 · Analytics & classification",
+        "5 · Web Search & Ranking",
+        "6 · Recommender System"
+    ]
+)
 
 # --------------------------------------------------------------------------- #
 # Tab 1 — acquisition: web crawl, public dataset, public API
@@ -2092,3 +2222,345 @@ with tab5:
                 authority can produce different rankings.
                 """
             )
+
+# =============================================================================
+# TAB 6 — SECTION E: RECOMMENDER SYSTEM
+# =============================================================================
+
+with tab6:
+
+    st.header("Recommender System")
+
+    st.caption(
+        "Content-based document recommendation using TF-IDF "
+        "representations and cosine similarity."
+    )
+
+    # -------------------------------------------------------------------------
+    # CORPUS CHECK
+    # -------------------------------------------------------------------------
+
+    if st.session_state.corpus is None:
+
+        st.warning(
+            "No corpus is currently loaded. "
+            "Go to **Acquire & store** and acquire documents first."
+        )
+
+    elif st.session_state.tokens is None:
+
+        st.warning(
+            "The corpus exists, but it has not been preprocessed yet."
+        )
+
+        st.info(
+            "Go to **Preprocess**, run preprocessing, "
+            "and then return to the Recommender System."
+        )
+
+    else:
+
+        corpus = st.session_state.corpus
+        tokens = st.session_state.tokens
+
+        # ---------------------------------------------------------------------
+        # RECOMMENDER DESCRIPTION
+        # ---------------------------------------------------------------------
+
+        st.subheader("1. Content-Based Recommendation")
+
+        st.write(
+            """
+            The recommender identifies documents that are similar in content
+            to a document selected by the user.
+
+            Each document is represented using TF-IDF features and cosine
+            similarity is used to measure document-to-document similarity.
+            """
+        )
+
+        # ---------------------------------------------------------------------
+        # DOCUMENT SELECTION
+        # ---------------------------------------------------------------------
+
+        st.subheader("2. Select a document")
+
+        document_options = []
+
+        for i in range(len(corpus)):
+
+            title = str(corpus.iloc[i]["title"]).strip()
+
+            if not title:
+                title = f"Document {i + 1}"
+
+            document_options.append(
+                f"{i} — {title[:100]}"
+            )
+
+        selected_option = st.selectbox(
+            "Choose a document to find similar documents",
+            document_options,
+            index=0
+        )
+
+        selected_index = int(
+            selected_option.split(" — ", 1)[0]
+        )
+
+        selected_doc = corpus.iloc[selected_index]
+
+        # ---------------------------------------------------------------------
+        # SELECTED DOCUMENT INFORMATION
+        # ---------------------------------------------------------------------
+
+        st.subheader("3. Selected document")
+
+        info1, info2, info3 = st.columns(3)
+
+        info1.metric(
+            "Document ID",
+            str(selected_doc["doc_id"])
+        )
+
+        info2.metric(
+            "Domain",
+            str(selected_doc["domain"])
+        )
+
+        info3.metric(
+            "Source",
+            str(selected_doc["source_type"])
+        )
+
+        st.write(
+            f"**Title:** {selected_doc['title']}"
+        )
+
+        st.write(
+            f"**URL:** {selected_doc['url']}"
+        )
+
+        with st.expander("View document preview"):
+
+            st.write(
+                str(selected_doc["raw_text"])[:1000]
+            )
+
+        # ---------------------------------------------------------------------
+        # TOP-K CONTROL
+        # ---------------------------------------------------------------------
+
+        st.subheader("4. Recommendation settings")
+
+        top_k = st.slider(
+            "Number of recommendations (Top-K)",
+            min_value=1,
+            max_value=min(20, max(1, len(corpus) - 1)),
+            value=min(5, max(1, len(corpus) - 1)),
+            step=1
+        )
+
+        recommend_button = st.button(
+            "Generate Recommendations",
+            type="primary",
+            use_container_width=True
+        )
+
+        # ---------------------------------------------------------------------
+        # GENERATE RECOMMENDATIONS
+        # ---------------------------------------------------------------------
+
+        if recommend_button:
+
+            with st.spinner(
+                "Finding similar documents..."
+            ):
+
+                recommendations = recommend_similar_documents(
+                    selected_index=selected_index,
+                    corpus_records=corpus,
+                    token_lists=tokens,
+                    top_k=int(top_k)
+                )
+
+            st.session_state[
+                "recommendations"
+            ] = recommendations
+
+            st.session_state[
+                "recommendation_source_index"
+            ] = selected_index
+
+        # ---------------------------------------------------------------------
+        # DISPLAY RECOMMENDATIONS
+        # ---------------------------------------------------------------------
+
+        if "recommendations" in st.session_state:
+
+            recommendations = st.session_state[
+                "recommendations"
+            ]
+
+            st.subheader(
+                "5. Top-K Recommendations"
+            )
+
+            if recommendations.empty:
+
+                st.info(
+                    "No sufficiently similar documents were found."
+                )
+
+            else:
+
+                # -------------------------------------------------------------
+                # Metrics
+                # -------------------------------------------------------------
+
+                m1, m2, m3 = st.columns(3)
+
+                m1.metric(
+                    "Recommendations",
+                    len(recommendations)
+                )
+
+                m2.metric(
+                    "Highest similarity",
+                    f"{recommendations['similarity'].max():.4f}"
+                )
+
+                m3.metric(
+                    "Average similarity",
+                    f"{recommendations['similarity'].mean():.4f}"
+                )
+
+                # -------------------------------------------------------------
+                # Recommendation table
+                # -------------------------------------------------------------
+
+                display_df = recommendations[
+                    [
+                        "rank",
+                        "title",
+                        "similarity",
+                        "domain",
+                        "source_type",
+                        "url"
+                    ]
+                ].copy()
+
+                display_df.columns = [
+                    "Rank",
+                    "Recommended Document",
+                    "Similarity Score",
+                    "Domain",
+                    "Source",
+                    "URL"
+                ]
+
+                st.dataframe(
+                    display_df,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                # -------------------------------------------------------------
+                # Detailed recommendation cards
+                # -------------------------------------------------------------
+
+                st.subheader(
+                    "Recommendation details"
+                )
+
+                for _, rec in recommendations.iterrows():
+
+                    with st.expander(
+                        f"#{int(rec['rank'])} — "
+                        f"{rec['title']} "
+                        f"(Similarity: {rec['similarity']:.4f})"
+                    ):
+
+                        st.write(
+                            f"**Similarity score:** "
+                            f"{rec['similarity']:.4f}"
+                        )
+
+                        st.write(
+                            f"**Domain:** {rec['domain']}"
+                        )
+
+                        st.write(
+                            f"**Source:** {rec['source_type']}"
+                        )
+
+                        st.write(
+                            f"**URL:** {rec['url']}"
+                        )
+
+                        st.write(
+                            f"**Preview:** {rec['preview']}"
+                        )
+
+                # -------------------------------------------------------------
+                # Similarity visualization
+                # -------------------------------------------------------------
+
+                st.subheader(
+                    "Recommendation similarity visualization"
+                )
+
+                plot_df = recommendations.copy()
+
+                plot_df = plot_df.sort_values(
+                    "similarity",
+                    ascending=True
+                )
+
+                fig, ax = plt.subplots(
+                    figsize=(10, 5)
+                )
+
+                ax.barh(
+                    plot_df["title"].str.slice(0, 50),
+                    plot_df["similarity"]
+                )
+
+                ax.set_xlabel(
+                    "Cosine Similarity"
+                )
+
+                ax.set_ylabel(
+                    "Recommended Document"
+                )
+
+                ax.set_title(
+                    "Top-K Content-Based Recommendations"
+                )
+
+                fig.tight_layout()
+
+                st.pyplot(fig)
+
+                # -------------------------------------------------------------
+                # Explanation
+                # -------------------------------------------------------------
+
+                st.info(
+                    """
+                    **How the recommendation works**
+
+                    1. The selected document is represented using TF-IDF.
+                    2. Every other document is also represented in the same
+                       TF-IDF feature space.
+                    3. Cosine similarity is calculated between the selected
+                       document and every other document.
+                    4. The selected document itself is excluded.
+                    5. Documents are sorted by similarity score.
+                    6. The highest-scoring Top-K documents are displayed.
+
+                    A higher similarity score indicates greater textual
+                    similarity between the selected document and the
+                    recommendation.
+                    """
+                )
