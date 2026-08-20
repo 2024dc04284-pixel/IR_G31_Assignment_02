@@ -40,6 +40,8 @@ import streamlit as st
 from bs4 import BeautifulSoup
 import networkx as nx
 from urllib.parse import urlparse
+from sklearn.metrics import precision_score, recall_score, f1_score
+import math
 
 DB_PATH = Path(__file__).resolve().parent / "crawl_store.db"
 SAMPLE_DATASET_PATH = Path(__file__).resolve().parent / "sample_dataset.csv"
@@ -1361,6 +1363,270 @@ def recommend_similar_documents(
 
 
 # =============================================================================
+# 6. EVALUATION METRICS
+# =============================================================================
+
+def precision_recall_f1(relevant, retrieved):
+    """
+    Calculate Precision, Recall and F1-score.
+
+    relevant  : set of ground-truth relevant document IDs
+    retrieved : list/set of retrieved document IDs
+    """
+
+    relevant = set(relevant)
+    retrieved = list(retrieved)
+
+    if not retrieved:
+        precision = 0.0
+    else:
+        precision = sum(
+            1 for doc_id in retrieved
+            if doc_id in relevant
+        ) / len(retrieved)
+
+    if not relevant:
+        recall = 0.0
+    else:
+        recall = sum(
+            1 for doc_id in retrieved
+            if doc_id in relevant
+        ) / len(relevant)
+
+    if precision + recall == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
+
+    return precision, recall, f1
+
+
+def precision_at_k(relevant, retrieved, k):
+    """
+    Precision@K
+    """
+
+    relevant = set(relevant)
+    retrieved_k = list(retrieved)[:k]
+
+    if not retrieved_k:
+        return 0.0
+
+    hits = sum(
+        1 for doc_id in retrieved_k
+        if doc_id in relevant
+    )
+
+    return hits / len(retrieved_k)
+
+
+def recall_at_k(relevant, retrieved, k):
+    """
+    Recall@K
+    """
+
+    relevant = set(relevant)
+    retrieved_k = list(retrieved)[:k]
+
+    if not relevant:
+        return 0.0
+
+    hits = sum(
+        1 for doc_id in retrieved_k
+        if doc_id in relevant
+    )
+
+    return hits / len(relevant)
+
+
+def average_precision(relevant, retrieved):
+    """
+    Average Precision (AP).
+
+    AP = average of precision values at ranks
+    where relevant documents are retrieved.
+    """
+
+    relevant = set(relevant)
+
+    if not relevant:
+        return 0.0
+
+    hits = 0
+    precision_sum = 0.0
+
+    for rank, doc_id in enumerate(retrieved, start=1):
+
+        if doc_id in relevant:
+            hits += 1
+            precision_sum += hits / rank
+
+    return precision_sum / len(relevant)
+
+
+def mean_average_precision(relevance_sets, retrieved_lists):
+    """
+    Mean Average Precision (MAP).
+
+    relevance_sets:
+        list of ground-truth relevant document sets
+
+    retrieved_lists:
+        list of ranked retrieval results
+    """
+
+    if not relevance_sets:
+        return 0.0
+
+    ap_scores = []
+
+    for relevant, retrieved in zip(
+        relevance_sets,
+        retrieved_lists
+    ):
+        ap_scores.append(
+            average_precision(relevant, retrieved)
+        )
+
+    if not ap_scores:
+        return 0.0
+
+    return sum(ap_scores) / len(ap_scores)
+
+
+def reciprocal_rank(relevant, retrieved):
+    """
+    Reciprocal Rank for one query.
+    """
+
+    relevant = set(relevant)
+
+    for rank, doc_id in enumerate(retrieved, start=1):
+
+        if doc_id in relevant:
+            return 1.0 / rank
+
+    return 0.0
+
+
+def mean_reciprocal_rank(relevance_sets, retrieved_lists):
+    """
+    Mean Reciprocal Rank (MRR).
+    """
+
+    if not relevance_sets:
+        return 0.0
+
+    rr_scores = []
+
+    for relevant, retrieved in zip(
+        relevance_sets,
+        retrieved_lists
+    ):
+        rr_scores.append(
+            reciprocal_rank(relevant, retrieved)
+        )
+
+    if not rr_scores:
+        return 0.0
+
+    return sum(rr_scores) / len(rr_scores)
+
+
+def ndcg_at_k(relevant, retrieved, k):
+    """
+    NDCG@K for binary relevance.
+
+    Relevant document = 1
+    Non-relevant document = 0
+    """
+
+    relevant = set(relevant)
+    retrieved_k = list(retrieved)[:k]
+
+    if not retrieved_k:
+        return 0.0
+
+    dcg = 0.0
+
+    for rank, doc_id in enumerate(
+        retrieved_k,
+        start=1
+    ):
+        if doc_id in relevant:
+            dcg += 1.0 / math.log2(rank + 1)
+
+    ideal_count = min(len(relevant), k)
+
+    if ideal_count == 0:
+        return 0.0
+
+    idcg = sum(
+        1.0 / math.log2(rank + 1)
+        for rank in range(1, ideal_count + 1)
+    )
+
+    if idcg == 0:
+        return 0.0
+
+    return dcg / idcg
+
+
+def evaluate_search_results(
+    relevant_docs,
+    retrieved_docs,
+    k=10
+):
+    """
+    Calculate all required evaluation metrics
+    for one query.
+    """
+
+    precision, recall, f1 = precision_recall_f1(
+        relevant_docs,
+        retrieved_docs
+    )
+
+    p_at_k = precision_at_k(
+        relevant_docs,
+        retrieved_docs,
+        k
+    )
+
+    r_at_k = recall_at_k(
+        relevant_docs,
+        retrieved_docs,
+        k
+    )
+
+    ap = average_precision(
+        relevant_docs,
+        retrieved_docs
+    )
+
+    rr = reciprocal_rank(
+        relevant_docs,
+        retrieved_docs
+    )
+
+    ndcg = ndcg_at_k(
+        relevant_docs,
+        retrieved_docs,
+        k
+    )
+
+    return {
+        "Precision": precision,
+        "Recall": recall,
+        "F1-score": f1,
+        "Precision@K": p_at_k,
+        "Recall@K": r_at_k,
+        "AP": ap,
+        "RR": rr,
+        "NDCG@K": ndcg
+    }
+
+# =============================================================================
 # STREAMLIT UI
 # =============================================================================
 
@@ -1375,14 +1641,15 @@ st.session_state.setdefault("tokens", None)
 if st.session_state.corpus is None and store_counts()[0] > 0:
     st.session_state.corpus = load_corpus()
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
         "1 · Acquire & store",
         "2 · Preprocess",
         "3 · Features & keywords",
         "4 · Analytics & classification",
         "5 · Web Search & Ranking",
-        "6 · Recommender System"
+        "6 · Recommender System",
+        "7 · Evaluation"
     ]
 )
 
@@ -2564,3 +2831,1316 @@ with tab6:
                     recommendation.
                     """
                 )
+
+# =============================================================================
+# TAB 7 — EVALUATION
+# =============================================================================
+with tab7:
+
+    st.header("7. Retrieval Evaluation")
+
+    st.write(
+        "Evaluate the effectiveness of the information retrieval system using "
+        "standard Information Retrieval metrics. Relevance judgments are "
+        "provided manually as ground truth for the selected query."
+    )
+
+    # -------------------------------------------------------------------------
+    # CHECK CORPUS / PREPROCESSING
+    # -------------------------------------------------------------------------
+    if st.session_state.corpus is None or st.session_state.tokens is None:
+
+        st.warning(
+            "Please acquire the corpus and run preprocessing in Sections 1 and 2 "
+            "before performing retrieval evaluation."
+        )
+
+    else:
+
+        corpus = st.session_state.corpus
+        tokens = st.session_state.tokens
+
+        if len(corpus) == 0:
+
+            st.warning("The corpus is empty. Please acquire documents first.")
+
+        else:
+
+            # =================================================================
+            # 1. EVALUATION QUERY
+            # =================================================================
+
+            st.subheader("1. Evaluation query")
+
+            eval_query = st.text_input(
+                "Enter a query to evaluate",
+                value=st.session_state.get(
+                    "evaluation_query_used",
+                    st.session_state.get(
+                        "search_query",
+                        "information retrieval"
+                    )
+                ),
+                key="evaluation_query_input",
+                help=(
+                    "Use a meaningful query related to the documents in your "
+                    "collection."
+                )
+            )
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                eval_k = st.number_input(
+                    "Evaluation K",
+                    min_value=1,
+                    max_value=min(50, len(corpus)),
+                    value=min(10, len(corpus)),
+                    step=1,
+                    key="evaluation_k_input",
+                    help=(
+                        "K is used for Precision@K, Recall@K and NDCG@K."
+                    )
+                )
+
+            with c2:
+                query_expansion_eval = st.checkbox(
+                    "Use query expansion",
+                    value=True,
+                    key="evaluation_query_expansion",
+                    help=(
+                        "Use the same query expansion strategy used by "
+                        "the retrieval system in Section 5."
+                    )
+                )
+
+            # =================================================================
+            # 2. BUILD GROUND-TRUTH DOCUMENT LIST
+            # =================================================================
+
+            st.subheader("2. Ground-truth relevance judgement")
+
+            st.write(
+                "Select every document that you consider relevant to the "
+                "evaluation query. These selections form the ground-truth "
+                "relevance set used by Precision, Recall, F1, MAP, MRR "
+                "and NDCG."
+            )
+
+            # -----------------------------------------------------------------
+            # Create a complete document list.
+            #
+            # IMPORTANT:
+            # Unlike the previous version, relevant documents are NOT limited
+            # to the documents returned by the search results.
+            # -----------------------------------------------------------------
+
+            doc_labels = []
+            label_to_index = {}
+
+            for idx, row in corpus.iterrows():
+
+                title = str(row.get("title", "Untitled document"))
+
+                doc_id = str(
+                    row.get(
+                        "doc_id",
+                        f"doc-{idx}"
+                    )
+                )
+
+                label = (
+                    f"{idx} | "
+                    f"{title[:100]} | "
+                    f"{doc_id}"
+                )
+
+                doc_labels.append(label)
+                label_to_index[label] = int(idx)
+
+            # Keep previously selected documents when possible.
+            previous_relevant = st.session_state.get(
+                "evaluation_relevant_indices",
+                []
+            )
+
+            previous_labels = [
+                label
+                for label, idx in label_to_index.items()
+                if idx in previous_relevant
+            ]
+
+            relevant_labels = st.multiselect(
+                "Ground-truth relevant documents",
+                options=doc_labels,
+                default=previous_labels,
+                key="evaluation_relevant_docs",
+                help=(
+                    "Select all documents that should be considered relevant "
+                    "to the evaluation query."
+                )
+            )
+
+            relevant_indices = [
+                label_to_index[label]
+                for label in relevant_labels
+            ]
+
+            relevant_indices = sorted(
+                set(relevant_indices)
+            )
+
+            # -----------------------------------------------------------------
+            # Ground-truth summary
+            # -----------------------------------------------------------------
+
+            q1, q2 = st.columns(2)
+
+            with q1:
+                st.metric(
+                    "Corpus documents",
+                    len(corpus)
+                )
+
+            with q2:
+                st.metric(
+                    "Ground-truth relevant documents",
+                    len(relevant_indices)
+                )
+
+            if relevant_indices:
+
+                st.success(
+                    f"{len(relevant_indices)} relevant document(s) selected "
+                    "as ground truth."
+                )
+
+            else:
+
+                st.info(
+                    "Select at least one relevant document before running "
+                    "the evaluation."
+                )
+
+            # =================================================================
+            # 3. RUN EVALUATION
+            # =================================================================
+
+            run_evaluation = st.button(
+                "Run Evaluation",
+                type="primary",
+                use_container_width=True,
+                key="run_section_f_evaluation"
+            )
+
+            if run_evaluation:
+
+                if not eval_query.strip():
+
+                    st.warning(
+                        "Please enter an evaluation query."
+                    )
+
+                elif not relevant_indices:
+
+                    st.warning(
+                        "Please select at least one relevant document "
+                        "as ground truth."
+                    )
+
+                else:
+
+                    with st.spinner(
+                        "Running retrieval and calculating IR metrics..."
+                    ):
+
+                        # -----------------------------------------------------
+                        # Retrieve enough documents for evaluation.
+                        #
+                        # We use up to 50 rather than the small UI search K so
+                        # Recall is not unnecessarily restricted.
+                        # -----------------------------------------------------
+
+                        retrieval_k = min(
+                            50,
+                            len(corpus)
+                        )
+
+                        baseline = search_documents(
+                            query=eval_query,
+                            corpus_records=corpus,
+                            token_lists=tokens,
+                            top_k=retrieval_k,
+                            use_query_expansion=query_expansion_eval
+                        )
+
+                        # -----------------------------------------------------
+                        # Make sure doc_index exists.
+                        # -----------------------------------------------------
+
+                        if (
+                            baseline is not None
+                            and not baseline.empty
+                            and "doc_index" in baseline.columns
+                        ):
+
+                            baseline_ranked = (
+                                baseline["doc_index"]
+                                .astype(int)
+                                .tolist()
+                            )
+
+                        else:
+
+                            baseline_ranked = []
+
+                        # -----------------------------------------------------
+                        # Local metric calculation.
+                        #
+                        # This is intentionally self-contained so Section F
+                        # does not depend on another UI block.
+                        # -----------------------------------------------------
+
+                        def calculate_section_f_metrics(
+                            ranked_indices,
+                            relevant_indices,
+                            k
+                        ):
+
+                            relevant_set = set(
+                                int(x)
+                                for x in relevant_indices
+                            )
+
+                            ranked = [
+                                int(x)
+                                for x in ranked_indices
+                            ]
+
+                            # Remove accidental duplicate document indices
+                            # while preserving ranking order.
+                            ranked_unique = list(
+                                dict.fromkeys(ranked)
+                            )
+
+                            hits = [
+                                1 if idx in relevant_set else 0
+                                for idx in ranked_unique
+                            ]
+
+                            retrieved_relevant = sum(hits)
+
+                            # -------------------------------------------------
+                            # Precision
+                            # -------------------------------------------------
+
+                            precision = (
+                                retrieved_relevant / len(ranked_unique)
+                                if ranked_unique
+                                else 0.0
+                            )
+
+                            # -------------------------------------------------
+                            # Recall
+                            # -------------------------------------------------
+
+                            recall = (
+                                retrieved_relevant / len(relevant_set)
+                                if relevant_set
+                                else 0.0
+                            )
+
+                            # -------------------------------------------------
+                            # F1
+                            # -------------------------------------------------
+
+                            if precision + recall > 0:
+
+                                f1 = (
+                                    2
+                                    * precision
+                                    * recall
+                                    / (precision + recall)
+                                )
+
+                            else:
+
+                                f1 = 0.0
+
+                            # -------------------------------------------------
+                            # Precision@K
+                            # -------------------------------------------------
+
+                            top_hits = hits[:k]
+
+                            p_at_k = (
+                                sum(top_hits) / k
+                                if k > 0
+                                else 0.0
+                            )
+
+                            # -------------------------------------------------
+                            # Recall@K
+                            # -------------------------------------------------
+
+                            r_at_k = (
+                                sum(top_hits) / len(relevant_set)
+                                if relevant_set
+                                else 0.0
+                            )
+
+                            # -------------------------------------------------
+                            # Average Precision
+                            # -------------------------------------------------
+
+                            running_hits = 0
+                            precision_sum = 0.0
+
+                            for rank, hit in enumerate(
+                                hits,
+                                start=1
+                            ):
+
+                                if hit:
+
+                                    running_hits += 1
+
+                                    precision_sum += (
+                                        running_hits / rank
+                                    )
+
+                            ap = (
+                                precision_sum / len(relevant_set)
+                                if relevant_set
+                                else 0.0
+                            )
+
+                            # -------------------------------------------------
+                            # Reciprocal Rank
+                            # -------------------------------------------------
+
+                            rr = 0.0
+
+                            for rank, hit in enumerate(
+                                hits,
+                                start=1
+                            ):
+
+                                if hit:
+
+                                    rr = 1.0 / rank
+                                    break
+
+                            # -------------------------------------------------
+                            # Binary NDCG@K
+                            # -------------------------------------------------
+
+                            dcg = 0.0
+
+                            for rank, hit in enumerate(
+                                top_hits,
+                                start=1
+                            ):
+
+                                if hit:
+
+                                    dcg += (
+                                        1.0
+                                        / math.log2(rank + 1)
+                                    )
+
+                            ideal_hits = min(
+                                len(relevant_set),
+                                k
+                            )
+
+                            idcg = sum(
+                                1.0 / math.log2(rank + 1)
+                                for rank in range(
+                                    1,
+                                    ideal_hits + 1
+                                )
+                            )
+
+                            ndcg = (
+                                dcg / idcg
+                                if idcg > 0
+                                else 0.0
+                            )
+
+                            return {
+                                "Precision": round(
+                                    precision,
+                                    4
+                                ),
+                                "Recall": round(
+                                    recall,
+                                    4
+                                ),
+                                "F1-score": round(
+                                    f1,
+                                    4
+                                ),
+                                "Precision@K": round(
+                                    p_at_k,
+                                    4
+                                ),
+                                "Recall@K": round(
+                                    r_at_k,
+                                    4
+                                ),
+                                "MAP": round(
+                                    ap,
+                                    4
+                                ),
+                                "MRR": round(
+                                    rr,
+                                    4
+                                ),
+                                "NDCG@K": round(
+                                    ndcg,
+                                    4
+                                )
+                            }
+
+                        # -----------------------------------------------------
+                        # Calculate baseline metrics
+                        # -----------------------------------------------------
+
+                        baseline_metrics = (
+                            calculate_section_f_metrics(
+                                baseline_ranked,
+                                relevant_indices,
+                                int(eval_k)
+                            )
+                        )
+
+                        comparison_rows = [
+                            {
+                                "Method": "TF-IDF retrieval",
+                                **baseline_metrics
+                            }
+                        ]
+
+                        # =====================================================
+                        # OPTIONAL TF-IDF + PAGERANK COMPARISON
+                        # =====================================================
+
+                        combined = pd.DataFrame()
+
+                        pagerank_available = (
+                            "pagerank"
+                            in st.session_state
+                            and
+                            isinstance(
+                                st.session_state["pagerank"],
+                                pd.DataFrame
+                            )
+                            and
+                            not st.session_state["pagerank"].empty
+                        )
+
+                        if pagerank_available:
+
+                            pr_df = (
+                                st.session_state["pagerank"]
+                                .copy()
+                            )
+
+                            # -------------------------------------------------
+                            # Identify the PageRank document-index column.
+                            # -------------------------------------------------
+
+                            pr_index_col = None
+
+                            for candidate in [
+                                "doc_index",
+                                "index"
+                            ]:
+
+                                if candidate in pr_df.columns:
+
+                                    pr_index_col = candidate
+                                    break
+
+                            # -------------------------------------------------
+                            # Identify PageRank score column.
+                            # -------------------------------------------------
+
+                            pr_score_col = None
+
+                            for candidate in [
+                                "pagerank",
+                                "page_rank",
+                                "PageRank"
+                            ]:
+
+                                if candidate in pr_df.columns:
+
+                                    pr_score_col = candidate
+                                    break
+
+                            if (
+                                pr_index_col is not None
+                                and pr_score_col is not None
+                                and not baseline.empty
+                            ):
+
+                                # -------------------------------------------------
+                                # Create a clean PageRank lookup.
+                                # -------------------------------------------------
+
+                                pr_lookup = (
+                                    pr_df[
+                                        [
+                                            pr_index_col,
+                                            pr_score_col
+                                        ]
+                                    ]
+                                    .copy()
+                                )
+
+                                pr_lookup[pr_index_col] = (
+                                    pd.to_numeric(
+                                        pr_lookup[pr_index_col],
+                                        errors="coerce"
+                                    )
+                                )
+
+                                pr_lookup[pr_score_col] = (
+                                    pd.to_numeric(
+                                        pr_lookup[pr_score_col],
+                                        errors="coerce"
+                                    )
+                                    .fillna(0.0)
+                                )
+
+                                pr_lookup = (
+                                    pr_lookup
+                                    .dropna(
+                                        subset=[pr_index_col]
+                                    )
+                                )
+
+                                # -------------------------------------------------
+                                # Merge TF-IDF results with PageRank.
+                                # -------------------------------------------------
+
+                                combined = baseline.copy()
+
+                                combined = combined.merge(
+                                    pr_lookup,
+                                    left_on="doc_index",
+                                    right_on=pr_index_col,
+                                    how="left"
+                                )
+
+                                combined["pagerank_score"] = (
+                                    combined[pr_score_col]
+                                    .fillna(0.0)
+                                )
+
+                                # -------------------------------------------------
+                                # Normalise TF-IDF scores.
+                                # -------------------------------------------------
+
+                                tfidf_min = (
+                                    combined["score"].min()
+                                )
+
+                                tfidf_max = (
+                                    combined["score"].max()
+                                )
+
+                                if tfidf_max > tfidf_min:
+
+                                    combined["tfidf_norm"] = (
+                                        (
+                                            combined["score"]
+                                            - tfidf_min
+                                        )
+                                        /
+                                        (
+                                            tfidf_max
+                                            - tfidf_min
+                                        )
+                                    )
+
+                                else:
+
+                                    combined["tfidf_norm"] = 0.0
+
+                                # -------------------------------------------------
+                                # Normalise PageRank.
+                                # -------------------------------------------------
+
+                                pr_min = (
+                                    combined["pagerank_score"]
+                                    .min()
+                                )
+
+                                pr_max = (
+                                    combined["pagerank_score"]
+                                    .max()
+                                )
+
+                                if pr_max > pr_min:
+
+                                    combined["pagerank_norm"] = (
+                                        (
+                                            combined[
+                                                "pagerank_score"
+                                            ]
+                                            - pr_min
+                                        )
+                                        /
+                                        (
+                                            pr_max
+                                            - pr_min
+                                        )
+                                    )
+
+                                else:
+
+                                    combined["pagerank_norm"] = 0.0
+
+                                # -------------------------------------------------
+                                # Combine relevance and PageRank.
+                                #
+                                # 75% TF-IDF + 25% PageRank
+                                # -------------------------------------------------
+
+                                combined["combined_score"] = (
+                                    0.75
+                                    * combined["tfidf_norm"]
+                                    +
+                                    0.25
+                                    * combined["pagerank_norm"]
+                                )
+
+                                combined = (
+                                    combined
+                                    .sort_values(
+                                        "combined_score",
+                                        ascending=False
+                                    )
+                                    .reset_index(
+                                        drop=True
+                                    )
+                                )
+
+                                combined["rank"] = (
+                                    np.arange(
+                                        1,
+                                        len(combined) + 1
+                                    )
+                                )
+
+                                combined_ranked = (
+                                    combined["doc_index"]
+                                    .astype(int)
+                                    .tolist()
+                                )
+
+                                combined_metrics = (
+                                    calculate_section_f_metrics(
+                                        combined_ranked,
+                                        relevant_indices,
+                                        int(eval_k)
+                                    )
+                                )
+
+                                comparison_rows.append(
+                                    {
+                                        "Method":
+                                            "TF-IDF + PageRank",
+                                        **combined_metrics
+                                    }
+                                )
+
+                        # =====================================================
+                        # STORE RESULTS
+                        # =====================================================
+
+                        st.session_state[
+                            "evaluation_results"
+                        ] = baseline
+
+                        st.session_state[
+                            "evaluation_combined"
+                        ] = combined
+
+                        st.session_state[
+                            "evaluation_metrics"
+                        ] = pd.DataFrame(
+                            comparison_rows
+                        )
+
+                        st.session_state[
+                            "evaluation_relevant_indices"
+                        ] = relevant_indices
+
+                        st.session_state[
+                            "evaluation_query_used"
+                        ] = eval_query
+
+                        st.session_state[
+                            "evaluation_k_used"
+                        ] = int(eval_k)
+
+                        st.session_state[
+                            "evaluation_query_expansion_used"
+                        ] = query_expansion_eval
+
+                    st.success(
+                        "Retrieval evaluation completed successfully."
+                    )
+
+            # =================================================================
+            # 4. DISPLAY RESULTS
+            # =================================================================
+
+            if "evaluation_metrics" in st.session_state:
+
+                st.divider()
+
+                st.subheader(
+                    "3. Retrieval effectiveness"
+                )
+
+                metrics_df = (
+                    st.session_state[
+                        "evaluation_metrics"
+                    ]
+                )
+
+                st.dataframe(
+                    metrics_df,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                # -------------------------------------------------------------
+                # Metric cards
+                # -------------------------------------------------------------
+
+                baseline_row = metrics_df.iloc[0]
+
+                c1, c2, c3, c4 = st.columns(4)
+
+                c1.metric(
+                    "Precision",
+                    f"{baseline_row['Precision']:.4f}"
+                )
+
+                c2.metric(
+                    "Recall",
+                    f"{baseline_row['Recall']:.4f}"
+                )
+
+                c3.metric(
+                    "F1-score",
+                    f"{baseline_row['F1-score']:.4f}"
+                )
+
+                c4.metric(
+                    "MAP",
+                    f"{baseline_row['MAP']:.4f}"
+                )
+
+                c5, c6, c7, c8 = st.columns(4)
+
+                c5.metric(
+                    "Precision@K",
+                    f"{baseline_row['Precision@K']:.4f}"
+                )
+
+                c6.metric(
+                    "Recall@K",
+                    f"{baseline_row['Recall@K']:.4f}"
+                )
+
+                c7.metric(
+                    "MRR",
+                    f"{baseline_row['MRR']:.4f}"
+                )
+
+                c8.metric(
+                    "NDCG@K",
+                    f"{baseline_row['NDCG@K']:.4f}"
+                )
+
+                # =================================================================
+                # 5. COMPARATIVE ANALYSIS
+                # =================================================================
+
+                st.subheader(
+                    "4. Comparative analysis"
+                )
+
+                if len(metrics_df) > 1:
+
+                    st.write(
+                        "The table compares the baseline TF-IDF retrieval "
+                        "with the TF-IDF + PageRank ranking. Higher values "
+                        "indicate better retrieval effectiveness."
+                    )
+
+                else:
+
+                    st.info(
+                        "PageRank results are not available for this "
+                        "evaluation. Run **Calculate PageRank** in "
+                        "Section 5 and then rerun Section 7."
+                    )
+
+                # -------------------------------------------------------------
+                # Comparison chart
+                # -------------------------------------------------------------
+
+                metric_names = [
+                    "Precision",
+                    "Recall",
+                    "F1-score",
+                    "Precision@K",
+                    "Recall@K",
+                    "MAP",
+                    "MRR",
+                    "NDCG@K"
+                ]
+
+                plot_df = (
+                    metrics_df
+                    .set_index("Method")
+                    [metric_names]
+                )
+
+                fig, ax = plt.subplots(
+                    figsize=(12, 5)
+                )
+
+                plot_df.T.plot(
+                    kind="bar",
+                    ax=ax
+                )
+
+                ax.set_ylim(
+                    0,
+                    1.05
+                )
+
+                ax.set_ylabel(
+                    "Score"
+                )
+
+                ax.set_xlabel(
+                    "IR metric"
+                )
+
+                ax.set_title(
+                    "Retrieval effectiveness comparison"
+                )
+
+                ax.tick_params(
+                    axis="x",
+                    rotation=35
+                )
+
+                fig.tight_layout()
+
+                st.pyplot(fig)
+
+                plt.close(fig)
+
+                # =================================================================
+                # 6. RANKED RESULTS USED FOR EVALUATION
+                # =================================================================
+
+                st.subheader(
+                    "5. Ranked results used for evaluation"
+                )
+
+                eval_results = (
+                    st.session_state[
+                        "evaluation_results"
+                    ]
+                )
+
+                relevant_set = set(
+                    st.session_state[
+                        "evaluation_relevant_indices"
+                    ]
+                )
+
+                if (
+                    eval_results is not None
+                    and not eval_results.empty
+                ):
+
+                    shown = (
+                        eval_results
+                        .copy()
+                    )
+
+                    shown["relevant"] = (
+                        shown["doc_index"]
+                        .astype(int)
+                        .isin(relevant_set)
+                    )
+
+                    shown["judgment"] = np.where(
+                        shown["relevant"],
+                        "Relevant",
+                        "Not relevant"
+                    )
+
+                    columns_to_show = [
+                        "rank",
+                        "doc_index",
+                        "title",
+                        "score",
+                        "judgment",
+                        "domain",
+                        "url"
+                    ]
+
+                    available_columns = [
+                        col
+                        for col in columns_to_show
+                        if col in shown.columns
+                    ]
+
+                    st.dataframe(
+                        shown[
+                            available_columns
+                        ],
+                        hide_index=True,
+                        use_container_width=True
+                    )
+
+                # =================================================================
+                # 7. RELEVANCE BY RANK
+                # =================================================================
+
+                if (
+                    eval_results is not None
+                    and not eval_results.empty
+                ):
+
+                    st.subheader(
+                        "6. Relevance distribution across ranks"
+                    )
+
+                    rank_analysis = (
+                        eval_results[
+                            [
+                                "rank",
+                                "doc_index"
+                            ]
+                        ]
+                        .copy()
+                    )
+
+                    rank_analysis["Relevant"] = (
+                        rank_analysis["doc_index"]
+                        .astype(int)
+                        .isin(relevant_set)
+                    )
+
+                    fig, ax = plt.subplots(
+                        figsize=(10, 4)
+                    )
+
+                    ax.plot(
+                        rank_analysis["rank"],
+                        rank_analysis["Relevant"].astype(int),
+                        marker="o"
+                    )
+
+                    ax.set_xlabel(
+                        "Rank position"
+                    )
+
+                    ax.set_ylabel(
+                        "Relevance"
+                    )
+
+                    ax.set_yticks(
+                        [0, 1]
+                    )
+
+                    ax.set_yticklabels(
+                        [
+                            "Not relevant",
+                            "Relevant"
+                        ]
+                    )
+
+                    ax.set_title(
+                        "Relevant Documents Across Ranking Positions"
+                    )
+
+                    ax.grid(
+                        True,
+                        alpha=0.3
+                    )
+
+                    fig.tight_layout()
+
+                    st.pyplot(fig)
+
+                    plt.close(fig)
+
+                # =================================================================
+                # 8. AUTOMATIC INTERPRETATION
+                # =================================================================
+
+                st.subheader(
+                    "7. Evaluation analysis"
+                )
+
+                precision = float(
+                    baseline_row["Precision"]
+                )
+
+                recall = float(
+                    baseline_row["Recall"]
+                )
+
+                f1 = float(
+                    baseline_row["F1-score"]
+                )
+
+                p_at_k = float(
+                    baseline_row["Precision@K"]
+                )
+
+                r_at_k = float(
+                    baseline_row["Recall@K"]
+                )
+
+                map_score = float(
+                    baseline_row["MAP"]
+                )
+
+                mrr_score = float(
+                    baseline_row["MRR"]
+                )
+
+                ndcg_score = float(
+                    baseline_row["NDCG@K"]
+                )
+
+                analysis_points = []
+
+                # -------------------------------------------------------------
+                # Precision
+                # -------------------------------------------------------------
+
+                if precision >= 0.8:
+
+                    analysis_points.append(
+                        "Precision is high, indicating that most retrieved "
+                        "documents are relevant."
+                    )
+
+                elif precision >= 0.5:
+
+                    analysis_points.append(
+                        "Precision is moderate, indicating that the "
+                        "retrieval system returns a reasonable proportion "
+                        "of relevant documents."
+                    )
+
+                else:
+
+                    analysis_points.append(
+                        "Precision is relatively low, indicating that "
+                        "several retrieved documents are not relevant "
+                        "to the query."
+                    )
+
+                # -------------------------------------------------------------
+                # Recall
+                # -------------------------------------------------------------
+
+                if recall >= 0.8:
+
+                    analysis_points.append(
+                        "Recall is high, indicating that the system retrieves "
+                        "most of the known relevant documents."
+                    )
+
+                elif recall >= 0.5:
+
+                    analysis_points.append(
+                        "Recall is moderate, so some relevant documents "
+                        "may still be missing from the retrieved results."
+                    )
+
+                else:
+
+                    analysis_points.append(
+                        "Recall is low, suggesting that the system misses "
+                        "a substantial portion of the known relevant documents."
+                    )
+
+                # -------------------------------------------------------------
+                # F1
+                # -------------------------------------------------------------
+
+                analysis_points.append(
+                    f"The F1-score of {f1:.4f} summarizes the balance "
+                    "between precision and recall."
+                )
+
+                # -------------------------------------------------------------
+                # P@K
+                # -------------------------------------------------------------
+
+                analysis_points.append(
+                    f"Precision@K is {p_at_k:.4f}, showing the quality "
+                    f"of the top-{int(eval_k)} retrieved results."
+                )
+
+                # -------------------------------------------------------------
+                # R@K
+                # -------------------------------------------------------------
+
+                analysis_points.append(
+                    f"Recall@K is {r_at_k:.4f}, showing how much of the "
+                    f"known relevant set appears within the top-{int(eval_k)} "
+                    "results."
+                )
+
+                # -------------------------------------------------------------
+                # MAP
+                # -------------------------------------------------------------
+
+                analysis_points.append(
+                    f"MAP is {map_score:.4f}. Higher MAP indicates that "
+                    "relevant documents tend to appear earlier in the ranking."
+                )
+
+                # -------------------------------------------------------------
+                # MRR
+                # -------------------------------------------------------------
+
+                analysis_points.append(
+                    f"MRR is {mrr_score:.4f}. A higher value means that "
+                    "the first relevant document appears closer to the top."
+                )
+
+                # -------------------------------------------------------------
+                # NDCG
+                # -------------------------------------------------------------
+
+                analysis_points.append(
+                    f"NDCG@K is {ndcg_score:.4f}, reflecting the quality "
+                    "of the ranking while giving greater importance to "
+                    "higher-ranked relevant documents."
+                )
+
+                for point in analysis_points:
+
+                    st.write(
+                        "• " + point
+                    )
+
+                # =================================================================
+                # 9. FINAL INFERENCE
+                # =================================================================
+
+                st.subheader(
+                    "8. Evaluation inference"
+                )
+
+                if (
+                    precision >= 0.7
+                    and recall >= 0.7
+                    and ndcg_score >= 0.7
+                ):
+
+                    st.success(
+                        "Overall, the retrieval system demonstrates strong "
+                        "effectiveness. The retrieved results contain a high "
+                        "proportion of relevant documents, cover a substantial "
+                        "portion of the known relevant set, and maintain good "
+                        "ranking quality."
+                    )
+
+                elif (
+                    precision >= 0.7
+                    and recall < 0.7
+                ):
+
+                    st.info(
+                        "The system shows good precision but comparatively "
+                        "lower recall. This indicates that the ranking is "
+                        "selective: the retrieved documents are generally "
+                        "relevant, but some relevant documents are not "
+                        "being retrieved."
+                    )
+
+                elif (
+                    precision < 0.7
+                    and recall >= 0.7
+                ):
+
+                    st.info(
+                        "The system achieves relatively good recall but "
+                        "lower precision. This means the system retrieves "
+                        "many relevant documents but also returns irrelevant "
+                        "documents."
+                    )
+
+                else:
+
+                    st.info(
+                        "The evaluation indicates room for improvement in "
+                        "retrieval effectiveness and ranking quality. "
+                        "Preprocessing, query expansion, TF-IDF weighting "
+                        "and PageRank integration can potentially improve "
+                        "the results."
+                    )
+
+                # =================================================================
+                # 10. METRIC DEFINITIONS
+                # =================================================================
+
+                with st.expander(
+                    "Metric definitions"
+                ):
+
+                    st.markdown(
+                        """
+                        **Precision**  
+                        Fraction of retrieved documents that are relevant.
+
+                        **Recall**  
+                        Fraction of the known relevant documents that were retrieved.
+
+                        **F1-score**  
+                        Harmonic mean of Precision and Recall.
+
+                        **Precision@K**  
+                        Precision considering only the top-K ranked documents.
+
+                        **Recall@K**  
+                        Recall considering only the top-K ranked documents.
+
+                        **MAP (Mean Average Precision)**  
+                        For this single-query evaluation, MAP is equivalent to
+                        Average Precision. It rewards relevant documents appearing
+                        earlier in the ranking.
+
+                        **MRR (Mean Reciprocal Rank)**  
+                        For this single-query evaluation, MRR is equivalent to
+                        Reciprocal Rank and measures how early the first relevant
+                        document appears.
+
+                        **NDCG@K**  
+                        Measures ranking quality while giving greater importance
+                        to relevant documents appearing near the top of the ranking.
+                        """
+                    )
